@@ -1,0 +1,99 @@
+name: Check Flink Version Compatibility
+
+on:
+  push:
+    branches:
+      - main
+      - 'release-**'
+    paths:
+      - 'pom.xml'
+      - 'docs/**/*.adoc'
+  pull_request:
+    branches:
+      - main
+      - 'release-**'
+    paths:
+      - 'pom.xml'
+      - 'docs/**/*.adoc'
+  workflow_dispatch:
+
+jobs:
+  check-compatibility:
+    runs-on: ubuntu-latest
+    name: Verify Flink version compatibility
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Install JBang
+        run: |
+          curl -Ls https://sh.jbang.dev | bash -s - app setup
+          echo "${HOME}/.jbang/bin" >> $GITHUB_PATH
+
+      - name: Extract Flink version from pom.xml
+        id: flink-version
+        run: |
+          FLINK_VERSION=$(grep -oP '<flink.version>\K[^<]+' pom.xml)
+          echo "Found Flink version: $FLINK_VERSION"
+          echo "version=$FLINK_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Extract K8s Operator versions from documentation
+        id: extract-operator-versions
+        run: |
+          # Find all unique Flink K8s Operator versions in asciidoc files
+          OPERATOR_VERSIONS=$(grep -roh "flink-kubernetes-operator-[0-9.]\+" docs/ | sort -u | sed 's/flink-kubernetes-operator-//')
+          
+          if [ -z "$OPERATOR_VERSIONS" ]; then
+            echo "No operator versions found in documentation"
+            echo "versions=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "Found Operator versions:"
+          echo "$OPERATOR_VERSIONS"
+          
+          # Format as JSON array for later steps
+          OPERATOR_VERSIONS_JSON=$(echo "$OPERATOR_VERSIONS" | jq -R . | jq -s .)
+          echo "versions=$OPERATOR_VERSIONS_JSON" >> $GITHUB_OUTPUT
+
+      - name: Copy checkVersions script
+        run: |
+          cp .github/scripts/checkVersions.java .
+
+      - name: Check compatibility with all operator versions
+        if: ${{ steps.extract-operator-versions.outputs.versions != '' }}
+        run: |
+          FLINK_VERSION="${{ steps.flink-version.outputs.version }}"
+          OPERATOR_VERSIONS='${{ steps.extract-operator-versions.outputs.versions }}'
+          
+          echo "Checking Flink version $FLINK_VERSION against operator versions:"
+          echo "$OPERATOR_VERSIONS" | jq -r '.[]'
+          
+          FAILED=false
+          
+          for OPERATOR_VERSION in $(echo "$OPERATOR_VERSIONS" | jq -r '.[]'); do
+            echo "-------------------------------------------"
+            echo "Checking against operator version: $OPERATOR_VERSION"
+            
+            jbang checkVersions.java "$FLINK_VERSION" --operator-version "$OPERATOR_VERSION"
+            EXIT_CODE=$?
+            
+            if [ $EXIT_CODE -ne 0 ]; then
+              FAILED=true
+              echo "❌ Flink version $FLINK_VERSION is not compatible with operator version $OPERATOR_VERSION"
+            else
+              echo "✅ Flink version $FLINK_VERSION is compatible with operator version $OPERATOR_VERSION"
+            fi
+          done
+          
+          if [ "$FAILED" = true ]; then
+            echo "::error::Flink version is not compatible with all operator versions mentioned in the documentation"
+            exit 1
+          fi
